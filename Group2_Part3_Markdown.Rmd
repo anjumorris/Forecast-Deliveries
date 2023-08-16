@@ -1,0 +1,746 @@
+---
+title: 'Group 2: Project Part 3'
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+## 1. Setup
+
+```{r setup the directory}
+setwd("/Users/anjali/Documents/university/Econ_5305/project/Group2_Final/")
+rm(list = ls())
+```
+
+```{r imports}
+library(openxlsx)
+library(readxl)
+library(ggplot2)
+library(dynlm)
+library(tidyverse)
+library(forecast)
+library(urca)
+library(lubridate)
+library(TSstudio)
+```
+
+```{r Read delivery data}
+data_1 <- read_excel("./delivery_data.xlsx")
+#View(data_1)
+
+# read the time series for unemployment
+# converting the counts to in 1000 values for easier analysis
+DELIVERIES<-ts(data_1$count/100000,frequency=365, start = c(2020,1,2))
+```
+
+## 2. Preliminary Exploratory Data Analysis
+
+### 2.1 5 Number Summary and Time Series Plot
+```{r EDA delivery data}
+cat("Delivery Data") 
+summary(DELIVERIES)
+cat("Count of the data") 
+length(DELIVERIES)
+cat("Standard deviation: ", sd(DELIVERIES))
+plot.ts(DELIVERIES, main="Delivery Data, daily",xlab = "Date",ylab ="Number of Deliveries (in 100 thousands = 10^5)")
+```
+**Plot Interpretation: ** The time series shows a slight upward trend over the time period from Jan 2020 to March 2023. We also see clear seasonality for each year which corresponds to people tending to buy more products towards the end of the year during the holidays. There is also possibility of there being weekly (7 day) cyclical behavior as well that we can could possibly explore. All the data expect for Jan 2020 and Feb 2020 are affected by COVID-19 buying behavior. We can see the rapid rise in online purchasing from 2020 March onwards till about 6 months.  
+
+## 2.2 Stationarity Checks
+```{r stationarity checks}
+ur.df(DELIVERIES,type="trend",lags=0)
+ur.df(DELIVERIES,type="drift",lags=0)
+```
+**Testing for Unit Root: ** The test statistic is very low and therefore we can conclude that there is no unit root. Therefore we continue to look at the ACF and PACF of the time series without taking difference. We can try models with first differnce as well to see if they perform better.
+
+#### 2.3 Auto-Correlations
+```{r ACF and PACF}
+par(mfrow=c(1,2), mar = c(3, 2, 3, 2))
+acf(DELIVERIES,lag= 20, main = "Deliveries, ACF")
+pacf(DELIVERIES,lag= 20, main ="Deliveries, PACF")
+```
+**Key Findings:**
+- In the ACF we see that that the correlation continuously falls but that it has some bumps. These bumps are approximately around 7 lags which indicates a weekly cyclical pattern.
+- Given that the there is a continuous fall in autocorrelation we can try to use AR(1) and similar models
+- Looking at PACF we see the a a large spike a lag1 . Then spikes at lag = 2,4,5,6. We can try AR(1) , AR(2), AR(6)
+- Since there are recurring small spikes we can also try ARMA(1,1), ARMA(2,2), ARMA(6,1), ARMA(6,2) , ARMA (6,6)
+- We do not see a smooth decay of towards zero in the PACF hence MA model is not indicated. Nevertheless we plan on modeling MA(1) and MA(2) process to see output patterns.
+- Seasonality - Annual and Weekly also needs to be considered. 
+
+#### 2.4 Decompostion Analysis
+
+```{r decomposition}
+decomposed <- decompose(DELIVERIES, type = "multiplicative")
+seasonal <- decomposed$seasonal
+trend <- decomposed$trend
+random <- decomposed$random
+
+par(mfrow=c(2,2) , mar = c(3, 2, 3, 2))
+plot(DELIVERIES, main = "Original Time Series")
+plot(trend, main = "Trend Component")
+plot(seasonal, main = "Seasonal Component")
+plot(random, main = "Random Component")
+```
+
+```{r plotting the components together}
+plot(DELIVERIES, main="Original Time Series with Trend and Seasonality", 
+     xlab="Year", ylab="Value", col="black")
+lines(trend, col = "red")
+lines(seasonal, col = "blue")
+legend("topright", c("Trend Component","Seasonal Component"), col = c("red","blue"), lty=1)
+```
+
+```{r remove seasonality and  trend}
+DELIVERIES_notrend <- DELIVERIES / trend /seasonal
+plot(DELIVERIES_notrend)
+lines(random, col = "red")
+acf(DELIVERIES_notrend,na.action = na.pass)
+pacf(DELIVERIES_notrend, na.action = na.pass)
+```
+
+
+```{r ACF and PACF of seasonal component}
+par(mfrow=c(2,2) , mar = c(3, 2, 3, 2))
+acf(DELIVERIES,lag= 20, main = "Deliveries, ACF")
+pacf(DELIVERIES,lag= 20, main ="Deliveries, PACF")
+acf(seasonal,lag= 20, main = "Seasonal Component, ACF")
+pacf(seasonal,lag= 20, main ="Seasonal Component, PACF")
+```
+**Notes: ** Looking at the ACF and PACF of the seasonal component in comparison to the original times series we see that the patterns are similar. The trend in the series is a deterministic trend (no unit root). Modeling the seasonal component will be similar to modelling the original series and vis-a-versa.   
+
+**Identified Tentative Models**
+- Auto ARIMA: ARIMA(5,1,3) 
+- Auto SARIMA: ARIMA(5,1,3)
+- AR(1)
+- AR(2)
+- AR(6)
+- ARMA(1,1)
+- ARMA(2,2)
+- ARMA(1,6)
+- ARMA(2,6)
+
+## 3. Models With No Seasonality
+
+```{r storage }
+
+# DATA SWITCH: Use all data for in sample evaluation
+DATA <- DELIVERIES
+
+# create a vector to store reference to all the models
+model_names <- c()
+model_aic <- c()
+model_bic <- c()
+model_cor <- c()
+model_adjR2 <- c()
+model_stationary <- c()
+model_invertible <-c()
+model_res_box_text <- c()
+```
+
+```{r function to store stuff}
+store.function <- function(name = "None",this_model,stationary = TRUE,invertible = TRUE){
+  model_names <<- append(model_names,name)
+  model_aic <<- append(model_aic,AIC(this_model))
+  model_bic <<- append(model_bic,BIC(this_model))
+  
+  this_cor <<- cor(fitted(this_model), DATA, use="pairwise.complete.obs")^2
+  model_cor<<-append(model_cor,this_cor)
+  num <- length(DATA)
+  this_adjR2 <<- 1-(1-this_cor)*(num-1)/(num-2)
+  model_adjR2<<-append(model_adjR2,this_adjR2)
+
+  this_res_box <<- Box.test(this_model$residuals, type="Ljung-Box")
+  model_res_box_text<<-append(model_res_box_text,this_res_box$p.value)
+  model_stationary <<- append(model_stationary,stationary)
+  model_invertible <<- append(model_invertible,invertible)  
+}
+```
+
+
+#### 3.1 Model 1: Auto ARIMA model
+```{r auto arima model}
+auto_arima <- auto.arima(DATA)
+auto_arima
+plot(auto_arima)
+store.function("auto_arima",auto_arima,FALSE,TRUE)
+```
+
+#### 3.2 Pure AR Models: AR(1) Model, AR(2) Model, AR(6) Model 
+
+```{r Pure AR models}
+# AR1
+ar1 <- arima(DATA, order=c(1, 0, 0))
+ar1
+ar2 <- arima(DATA, order=c(2, 0, 0))
+ar2
+ar6 <- arima(DATA, order=c(6, 0, 0))
+ar6
+ar6_d1 <- arima(DATA, order=c(6, 1, 0))
+ar6_d1
+```
+
+```{r pure ar model plots}
+par(mfrow=c(2,2) , mar = c(3, 2, 3, 2))
+plot(ar1, main ="AR1: Inverse Roots")
+plot(ar2, main ="AR2: Inverse Roots")
+plot(ar6, main ="AR6: Inverse Roots")
+plot(ar6_d1, main ="AR6 - 1st Difference: Inverse Roots")
+```
+
+**Notes:** The AR6 model looks quite good with a very good AIC. However 1 root is very close to 1 making it not sufficiently stationary so decided to model with the first difference.  
+
+```{r store pure AR models}
+store.function("ar1",ar1,TRUE,TRUE)
+store.function("ar2",ar2,TRUE,TRUE)
+store.function("ar6",ar6,FALSE,TRUE)
+store.function("ar6_d1",ar6_d1,TRUE,TRUE)
+```
+
+#### 3.3 Pure MA Models: Models 7,8: MA(1) Model, MA(2) Model
+
+```{r Pure MA models}
+ma1 <- arima(DATA, order=c(0, 0, 1))
+ma1
+ma2 <- arima(DATA, order=c(0, 0, 2))
+ma2
+```
+```{r pure MA model plots}
+par(mfrow=c(1,2) , mar = c(3, 2, 3, 2))
+plot(ma1, main ="MA1: Inverse MA Roots")
+plot(ma2, main ="MA2: Inverse MA Roots")
+store.function("ma1",ma1,TRUE,TRUE)
+store.function("ma2",ma2,TRUE,TRUE)
+```
+**Notes:** The pure MA models have much higher aic we will still store the key values for future reference.
+
+#### 3.4 ARMA Models:
+```{r  ARMA models simplest}
+# ARMA(1,1)
+ar1_ma1 <- arima(DATA, order=c(1, 0, 1))
+ar1_ma1
+# ARMA(1,2)
+ar1_ma2 <- arima(DATA, order=c(1, 0, 2))
+ar1_ma2
+plot(ar1_ma1)
+store.function("ar1_ma1",ar1_ma1,TRUE,TRUE)
+plot(ar1_ma2)
+store.function("ar1_ma2",ar1_ma2,TRUE,TRUE)
+```
+```{r ARMA model more complex}
+# ARMA(2,0,2)
+ar2_ma2 <- arima(DATA, order=c(2, 0, 2))
+ar2_ma2
+# ARMA(2,1,2)
+ar2_ma2_d1 <- arima(DATA, order=c(2, 1, 2))
+ar2_ma2_d1
+# ARMA(2,1)
+ar2_ma1 <- arima(DATA, order=c(2, 0, 1))
+ar2_ma1
+# ARMA(2,1,1)
+ar2_ma1_d1 <- arima(DATA, order=c(2, 1, 1))
+ar2_ma1_d1
+
+plot(ar2_ma2)
+store.function("ar2_ma2",ar2_ma2,FALSE,TRUE)
+plot(ar2_ma2_d1)
+store.function("ar2_ma2_d1",ar2_ma2_d1,TRUE,TRUE)
+plot(ar2_ma1)
+store.function("ar2_ma1",ar2_ma1,FALSE,TRUE)
+plot(ar2_ma1_d1)
+store.function("ar2_ma1_d1",ar2_ma1_d1,TRUE,TRUE)
+```
+
+```{r arma models most complex}
+# ARMA(6,1)
+ar6_ma1 <- arima(DATA, order=c(6, 0, 1))
+ar6_ma1
+plot(ar6_ma1)
+store.function("ar6_ma1",ar6_ma1,FALSE,TRUE)
+# ARMA(6,1,1)
+ar6_ma1_d1 <- arima(DATA, order=c(6, 1, 1))
+ar6_ma1_d1
+plot(ar6_ma1_d1)
+store.function("ar6_ma1_d1",ar6_ma1_d1,TRUE,TRUE)
+
+# ARMA(6,2)
+ar6_ma2 <- arima(DATA, order=c(6, 0, 2))
+ar6_ma2
+plot(ar6_ma2)
+store.function("ar6_ma2",ar6_ma2,FALSE,TRUE)
+# ARMA(6,1,2)
+ar6_ma2_d1 <- arima(DATA, order=c(6, 1, 2))
+ar6_ma2_d1
+plot(ar6_ma2_d1)
+store.function("ar6_ma2_d1",ar6_ma2_d1,FALSE,FALSE)
+
+# ARMA(6,4)
+ar6_ma4 <- arima(DATA, order=c(6, 0, 4))
+ar6_ma4
+plot(ar6_ma4)
+store.function("ar6_ma4",ar6_ma4,FALSE,FALSE)
+# ARMA(6,1,4)
+ar6_ma4_d1 <- arima(DATA, order=c(6, 1, 4))
+ar6_ma4_d1
+plot(ar6_ma4_d1)
+store.function("ar6_ma4_d1",ar6_ma4_d1,FALSE,FALSE)
+
+# ARMA(6,6)
+ar6_ma6 <- arima(DATA, order=c(6, 0, 6))
+ar6_ma6
+plot(ar6_ma6)
+store.function("ar6_ma6",ar6_ma6,FALSE,FALSE)
+# ARMA(6,1,6)
+ar6_ma6_d1 <- arima(DATA, order=c(6, 1, 6))
+ar6_ma6_d1
+plot(ar6_ma6_d1)
+store.function("ar6_ma6_d1",ar6_ma6_d1,FALSE,FALSE)
+```
+**Notes on ARMA model:** As we use more complex processes i.e. higher order of AR and MA it becomes harder to find model where the roots are stationary and invertible. Modeling the ARMA(6,q) process we see that only ARMA(6,1,1) is having all roots that are within the circle. 
+
+
+## 4. Models with Seasonality
+
+#### 4.0  ACF and PACF of with diff(7)
+
+```{r ACF and PACF of diff 7}
+diff_weekly <- diff(DATA,7)
+ts.plot(diff_weekly)
+ur.df(diff_weekly,type="drift",lags=0)
+par(mfrow=c(1,2), mar = c(3, 2, 3, 2))
+acf(diff_weekly, lag = 40, na.action = na.pass, main = "Deliveries with Difference = 7, ACF")
+pacf(diff_weekly, lag = 40,  na.action = na.pass, main = "Deliveries with Difference = 7, PACF")
+```
+**Choice of Tentative Seasonal Arima Models**
+We plan to consider seasonal Arima models of the form (p,d,q)(P,D,Q)[7] as out data has weekly cycles. To identify the order for the seasonal model we look at the ACF and PACF of the Diff(7) of the original series. Looking at the ACF we see gradually falling spikes -> indicates AR behavior. On the PACF there are spikes at lag = 1,2 and 7 indicating AR2 or AR7 models. The PACF also has a rapidly declining autocorrelation. Looking at the ACF we see there are spike at Lag = 1,2,3,4 and 7 indicating MA1 , MA2, MA3, MA4, MA7 . Note in our analysis we do not consider the spikes after the 7th lag as these are in the cyclical pattern.
+We will try the following tentative models. We try to model simpler models first before going with models with higher complexity
+1. sarima_ar2_ma1 = (2,0,0)(0,0,1)[7] 
+2. sarima_ar2_ma4 = (2,0,0)(0,0,4)[7]
+3. sarima_ar7_ma1 = (7,0,0)(0,0,1)[7]
+4. sarima_ar7_ma4 = (7,0,0)(0,0,4)[7]
+
+#### 4.1 Model 2: Auto SARIMA model
+
+```{r sarima model 1}
+sarima_ar2_ma1 = arima(DATA, order = c(2,0,0), seasonal = list(order = c(0,0,1), period = 7))
+sarima_ar2_ma1
+plot(sarima_ar2_ma1)
+store.function("sarima_ar2_ma1",sarima_ar2_ma1,TRUE,TRUE)
+```
+```{r sarima model 2}
+sarima_ar2_ma4 = arima(DATA, order = c(2,0,0), seasonal = list(order = c(0,0,4), period = 7))
+sarima_ar2_ma4
+plot(sarima_ar2_ma4)
+store.function("sarima_ar2_ma4",sarima_ar2_ma4,TRUE,TRUE)
+```
+
+
+```{r sarima model 3}
+sarima_ar7_ma1 = arima(DATA, order = c(7,0,0), seasonal = list(order = c(0,0,1), period = 7))
+sarima_ar7_ma1
+plot(sarima_ar7_ma1)
+store.function("sarima_ar7_ma1",sarima_ar7_ma1,TRUE,TRUE)
+```
+
+
+```{r sarima model 4}
+sarima_ar7_ma4 = arima(DATA, order = c(7,0,0), seasonal = list(order = c(0,0,4), period = 7))
+sarima_ar7_ma4
+plot(sarima_ar7_ma4)
+store.function("sarima_ar7_ma4",sarima_ar7_ma4,TRUE,TRUE)
+# 
+# fcast1<-numeric(prediction_size)
+# ferror1<-numeric(prediction_size)
+# loss1<-numeric(prediction_size)
+# 
+# for (i in  1: prediction_size) {
+# refit_sarima_ar7_ma4 <- Arima(DELIVERIES[1:estimation_size + i], model=sarima_ar7_ma4)
+# fcast1[i]<-forecast(refit_sarima_ar7_ma4, h=1)$mean
+# ferror1[i] <- ps[i] - fcast1[i]
+# loss1[i] <- ferror1[i]^2
+# }
+# 
+# mpetest1 <- lm(ferror1 ~ 1)
+# summary(mpetest1)
+# 
+# IETest1 <- lm(ferror1 ~ fcast1)
+# summary(IETest1)
+```
+
+## 4. Check Stationarity and Invertibility
+
+```{r}
+# combine everything into 1 large data frame
+all_models <- data.frame(model_names, model_aic, model_bic, model_cor,model_adjR2, model_res_box_text,model_stationary, model_invertible)
+all_models
+```
+
+
+```{r narrowing down the models}
+filtered_models <- all_models[all_models$model_stationary & all_models$model_invertible, ]
+sorted_models <- filtered_models[order(filtered_models$model_aic,decreasing = FALSE), ]
+sorted_models
+```
+**Notes: ** After filtering out only the models that have AR and MA roots that are within the circle we sorted all the models to find the top models in terms of R-Squared. We will go ahead with the top 5 models listed and plot their residuals in the next section.  
+
+## 5. Check Residuals
+```{r Residual plots}
+
+Box.test(sarima_ar7_ma4$residuals, type="Ljung-Box")
+Box.test(sarima_ar7_ma1$residuals, type="Ljung-Box")
+Box.test(ar6_d1$residuals, type="Ljung-Box")
+Box.test(ar6_ma1_d1$residuals, type="Ljung-Box")
+Box.test(ar2_ma2_d1$residuals, type="Ljung-Box")
+
+par(mfrow=c(2,2) , mar = c(3, 2, 3, 2))
+acf(sarima_ar7_ma4$residuals, na.action=na.pass, main = "ACF: SARIMA1 (7,0,0)(0,0,4) [7] residuals")
+pacf(sarima_ar7_ma4$residuals, na.action=na.pass, main = "PACF: SARIMA1 (7,0,0)(0,0,4) [7] residuals")
+acf(sarima_ar7_ma1$residuals, na.action=na.pass, main = "ACF: SARIMA2 (7,0,0)(0,0,1) [7] residuals")
+pacf(sarima_ar7_ma1$residuals, na.action=na.pass, main = "PACF: SARIMA2 (7,0,0)(0,0,1) [7] residuals")
+
+par(mfrow=c(3,2) , mar = c(3, 2, 3, 2))
+acf(ar6_d1$residuals, na.action=na.pass, main = "ACF: AR (6,1,0) residuals")
+pacf(ar6_d1$residuals, na.action=na.pass, main = "PACF: AR (6,1,0) residuals")
+acf(ar6_ma1_d1$residuals, na.action=na.pass, main = "ACF: ARMA (6,1,1) residuals")
+pacf(ar6_ma1_d1$residuals, na.action=na.pass, main = "PACF: ARMA (6,1,1) residuals")
+acf(ar2_ma2_d1$residuals, na.action=na.pass, main = "ACF: ARMA (2,1,2) residuals")
+pacf(ar2_ma2_d1$residuals, na.action=na.pass, main = "ACF: ARMA (2,1,2) residuals")
+
+```
+The top 5 models all pass the Q-test white noise test for residuals.The top two models show no spikes in the ACF and 2 or 3 spikes in the PACF  
+
+
+## 6. Multistep Forecast (In Sample)
+The top 5 models have still some residuals that can be still removed. However all Pass the Box Ljung Test for white noise
+
+```{r in sample forecast}
+n = 7
+
+# Sarima (7,0,0)(0,0,4)[7] (sarima1)
+forecast1 <- forecast(sarima_ar7_ma4, h = n)
+forecast1
+plot(forecast1, main = "DELIVERIES - Forecast (SARIMA (7,0,0)(0,0,4)[7])",include=150)
+lines(fitted(sarima_ar7_ma4),col="red")
+lines(DATA) #plot the original series
+legend("bottomleft", legend=c("Actual", "Fitted","Forecast"), lty=c(1,1,1), col=c( "black","red", "blue"))
+
+# Sarima (7,0,0)(0,0,1)[7] (sarima2)
+forecast2 <- forecast(sarima_ar7_ma1, h = n)
+forecast2
+plot(forecast2, main = "DELIVERIES - Forecast (SARIMA (7,0,0)(0,0,1)[7])",include=150)
+lines(fitted(sarima_ar7_ma1),col="red")
+lines(DATA) #plot the original series
+legend("bottomleft", legend=c("Actual", "Fitted","Forecast"), lty=c(1,1,1), col=c( "black","red", "blue"))
+
+# ARMA (6,1,0) (ar6_d1)
+forecast3 <- forecast(ar6_d1, h = n)
+forecast3
+plot(forecast3, main = "DELIVERIES - Forecast (AR (6, 1, 0))", include=150)
+lines(fitted(ar6_d1),col="red")
+lines(DATA) #plot the original series
+legend("bottomleft", legend=c("Actual", "Fitted","Forecast"), lty=c(1,1,1), col=c( "black","red", "blue"))
+
+# ARMA (6,1,1) (ar6_ma1_d1)
+forecast4 <- forecast(ar6_ma1_d1, h = n)
+forecast4
+plot(forecast4, main = "DELIVERIES - Forecast (ARMA (6, 1, 1))", include=150)
+lines(fitted(ar6_ma1_d1),col="red")
+lines(DATA) #plot the original series
+legend("bottomleft", legend=c("Actual", "Fitted","Forecast"), lty=c(1,1,1), col=c( "black","red", "blue"))
+
+# ARMA (2,1,2) (ar2_ma2_d1)
+forecast5 <- forecast(ar2_ma2_d1, h = n)
+forecast5
+plot(forecast5, main = "DELIVERIES - Forecast (ARMA (2, 1, 2))", include=150)
+lines(fitted(ar2_ma2_d1),col="red")
+lines(DATA) #plot the original series
+legend("bottomleft", legend=c("Actual", "Fitted","Forecast"), lty=c(1,1,1), col=c( "black","red", "blue"))
+```
+
+## 7. Out-of Sample Analysis - Optimality of the forecast
+The following Models are analyzed using out-of sample techniques 
+Model 1: sarima_ar7_ma4 - SARIMA (7,0,0)(0,0,4)[7]
+Model 2: sarima_ar7_ma1	- SARIMA (7,0,0)(0,0,1)[7]
+Model 3: ar6_d1 - ARMA(6,1,0)
+Model 4: ar6_ma1_d1 - ARMA(6,1,1)
+Model 5: ar2_ma2_d1 - ARMA(2,1,2)
+
+```{r Create estimation prediction sample}
+prediction_size <- round(length(DATA)*0.10,0)
+# hardcode 
+#prediction_size<- 21
+  
+split <- ts_split(ts.obj = DATA, sample.out = prediction_size)
+es <- split$train
+ps <- split$test
+plot(es, ylab="Numbers (in 100 thousands = 10^5)", main = "Deliveries in Seattle Area")
+lines(ps,col = "red")
+estimation_size <- length(es)
+prediction_size
+estimation_size
+```
+
+We will do the Forecast Optimal Test for the top 5 models from the previous in-sample analysis
+
+```{r Forecast Optimality Tests Model 1 }
+# Model 1 SARIMA (7,0,0)(0,0,4)[7]
+fcast1<-numeric(prediction_size) 
+ferror1<-numeric(prediction_size) 
+loss1<-numeric(prediction_size) 
+
+for (i in  1: prediction_size) {
+refit_model1 <- Arima(DELIVERIES[1:estimation_size + i], model=sarima_ar7_ma4)
+fcast1[i]<-forecast(refit_model1, h=1)$mean
+ferror1[i] <- ps[i] - fcast1[i]
+loss1[i] <- ferror1[i]^2
+}
+
+mpetest1 <- lm(ferror1 ~ 1)
+summary(mpetest1)
+
+IETest1 <- lm(ferror1 ~ fcast1)
+summary(IETest1)
+```
+
+```{r Forecast Optimality Tests Model 2 }
+# Model 2 SARIMA (7,0,0)(0,0,1)[7]
+fcast2<-numeric(prediction_size) 
+ferror2<-numeric(prediction_size) 
+loss2<-numeric(prediction_size) 
+
+for (i in  1: prediction_size) {
+refit_model2 <- Arima(DELIVERIES[1:estimation_size + i], model=sarima_ar7_ma1)
+fcast2[i]<-forecast(refit_model2, h=1)$mean
+ferror2[i] <- ps[i] - fcast2[i]
+loss2[i] <- ferror2[i]^2
+}
+
+mpetest2 <- lm(ferror2 ~ 1)
+summary(mpetest1)
+
+IETest2 <- lm(ferror2 ~ fcast2)
+summary(IETest2)
+```
+
+
+```{r Forecast Optimality Tests Model 3 }
+# Model 3 - ARMA (6,1,0)
+fcast3<-numeric(prediction_size) 
+ferror3<-numeric(prediction_size) 
+loss3<-numeric(prediction_size) 
+
+for (i in  1: prediction_size) {
+refit_model3 <- Arima(DELIVERIES[1:estimation_size + i], model=ar6_d1)
+fcast3[i]<-forecast(refit_model3, h=1)$mean
+ferror3[i] <- ps[i] - fcast3[i]
+loss3[i] <- ferror3[i]^2
+}
+
+mpetest3 <- lm(ferror3 ~ 1)
+summary(mpetest3)
+
+IETest3 <- lm(ferror3 ~ fcast3)
+summary(IETest3)
+```
+
+
+```{r Forecast Optimality Tests Model 4 }
+# Model 4 - ARMA (6,1,1)
+fcast4<-numeric(prediction_size) 
+ferror4<-numeric(prediction_size) 
+loss4<-numeric(prediction_size) 
+
+for (i in  1: prediction_size) {
+refit_model4 <- Arima(DELIVERIES[1:estimation_size + i], model=ar6_ma1_d1)
+fcast4[i]<-forecast(refit_model4, h=1)$mean
+ferror4[i] <- ps[i] - fcast4[i]
+loss4[i] <- ferror4[i]^2
+}
+
+mpetest4 <- lm(ferror4 ~ 1)
+summary(mpetest4)
+
+IETest4 <- lm(ferror4 ~ fcast4)
+summary(IETest4)
+```
+
+```{r Forecast Optimality Tests Model 5 }
+# Model 5 - ARMA (6,1,1)
+fcast5<-numeric(prediction_size) 
+ferror5<-numeric(prediction_size) 
+loss5<-numeric(prediction_size) 
+
+for (i in  1: prediction_size) {
+refit_model5 <- Arima(DELIVERIES[1:estimation_size + i], model= ar2_ma2_d1)
+fcast5[i]<-forecast(refit_model5, h=1)$mean
+ferror5[i] <- ps[i] - fcast5[i]
+loss5[i] <- ferror5[i]^2
+}
+
+mpetest5 <- lm(ferror5 ~ 1)
+summary(mpetest5)
+
+IETest5 <- lm(ferror5 ~ fcast5)
+summary(IETest5)
+```
+
+
+```{r Naive Model }
+#Naive Model
+fcast_naive<-numeric(prediction_size) 
+ferror_naive<-numeric(prediction_size) 
+loss_naive<-numeric(prediction_size)
+start_index = length(DELIVERIES) - prediction_size
+
+for (i in 1:prediction_size){ 
+  fcast_naive[i]<-DELIVERIES[start_index -1 + i] 
+  ferror_naive[i]<-DELIVERIES[start_index+i]- fcast_naive[i]
+  loss_naive[i] <-ferror_naive[i]^2
+ } 
+
+mpetest_naive <- lm(ferror_naive ~ 1)
+summary(mpetest_naive)
+
+IETest_naive <- lm(ferror_naive ~ fcast_naive)
+summary(IETest_naive)
+```
+
+```{r Simple Average Model }
+#Average Model - taking average of last 4 observations
+fcast_avg<-numeric(prediction_size) 
+ferror_avg<-numeric(prediction_size) 
+loss_avg<-numeric(prediction_size)
+start_index = length(DELIVERIES) - prediction_size
+
+for (i in 1:prediction_size){ 
+  fcast_avg[i]<-(DELIVERIES[start_index -1 + i] + DELIVERIES[start_index -2 + i]  + DELIVERIES[start_index -3 + i] + DELIVERIES[start_index -4 + i])/4
+  
+  ferror_avg[i]<-DELIVERIES[start_index+i]- fcast_avg[i]
+  loss_avg[i] <-ferror_avg[i]^2
+ } 
+
+mpetest_avg <- lm(ferror_avg ~ 1)
+summary(mpetest_avg)
+
+IETest_avg <- lm(ferror_avg ~ fcast_avg)
+summary(IETest_avg)
+```
+
+# 8. Out of Sample Analysis - Test of Preditive ability
+```{r Assessment of Forecasts}
+cat("Model 1: \n")
+accuracy(fcast1, ps)
+MSE1 <- mean(loss1)
+cat("MSE: ", MSE1)
+
+cat("\n\nModel 2: \n")
+accuracy(fcast2, ps)
+MSE2 <- mean(loss2)
+cat("MSE: ", MSE2)
+
+cat("\n\nModel 3: \n")
+accuracy(fcast3, ps)
+MSE3 <- mean(loss3)
+cat("MSE: ", MSE3)
+
+cat("\n\nModel 4: \n")
+accuracy(fcast4, ps)
+MSE4 <- mean(loss4)
+cat("MSE: ", MSE4)
+
+cat("\n\nModel 5: \n")
+accuracy(fcast5, ps)
+MSE5 <- mean(loss5)
+cat("MSE: ", MSE5)
+
+cat("\n\nNaive Model: \n")
+accuracy(fcast_naive, ps)
+MSE_naive <- mean(loss_naive)
+cat("MSE: ", MSE_naive)
+
+cat("\n\n4 period average Model: \n")
+accuracy(fcast_avg, ps)
+MSE_avg <- mean(loss_avg)
+cat("MSE: ", MSE_avg)
+```
+
+Notes: The lowest MSE are from model3 , model4 and model5 therefore we will use these models for creating the combination models.  
+
+
+## 9. Out of Sample Analysis - Combination Models 
+
+#### 9.1 Combination Model using equal weighted forecast
+```{r Combo1 - equal weighted}
+combo1 <- (fcast3 + fcast4 + fcast5)/3
+ferror_combo1 <- ps - combo1
+loss_combo1 <- ferror_combo1^2
+
+MSE_combo1 <- mean(loss_combo1)
+MSE_combo1
+
+mpetest_combo1 <- lm(ferror_combo1 ~ 1)
+summary(mpetest_combo1)
+
+IETest_combo1 <- lm(ferror_combo1 ~ combo1)
+summary(IETest_combo1)
+```
+
+#### 9.2 Combination Model using inverse of MSE
+```{r Combo2 - inverse weighted}
+sumMSE_inv <- (1/MSE3) + (1/MSE4) + (1/MSE5)
+w3 <- (1/MSE3)/sumMSE_inv
+w3
+w4 <- (1/MSE4)/sumMSE_inv
+w4
+w5 <- (1/MSE5)/sumMSE_inv
+w5
+
+combo2 <- w3*fcast3 + w4*fcast4 + w5*fcast5
+
+ferror_combo2 <- ps - combo2
+loss_combo2 <- ferror_combo2^2
+MSE1_combo2 <- mean(loss_combo2)
+MSE1_combo2
+
+mpetest_combo2 <- lm(ferror_combo2 ~ 1)
+summary(mpetest_combo2)
+
+IETest_combo2 <- lm(ferror_combo2 ~ combo2)
+summary(IETest_combo2)
+```
+
+#### 9.3 Combination Model using OLS weights
+
+```{r Combo3 - OLS weighted}
+combo3<-lm(ps~fcast3+fcast4+fcast5)
+summary(combo3)
+
+fcast_combo3<-predict(combo3)
+ferror_combo3 <- ps - fcast_combo3
+loss_combo3 <- ferror_combo3^2
+
+mpetest_combo3 <- lm(ferror_combo3 ~ 1)
+summary(mpetest_combo3)
+
+IETest_combo3 <- lm(ferror_combo3 ~ fcast_combo3)
+summary(IETest_combo3)
+
+MSE_combo3 <- mean(loss_combo3)
+MSE_combo3
+#plot(combo3)
+```
+## 10. Out of Sample - Visualizing the best forecast - Combination Model 3 - OLS weighted
+
+```{r OLS weighted visualization}
+#summary(combo3)
+final_forecast <-ts(fcast_combo3,start = end(es),frequency = 365)
+
+plot(ps, main = "DELIVERIES - OLS Weighted Optimal Forecast (1-step)",col="black",xlab ="Prediction Sample, Daily", ylab= "Number of Deliveries (in 10^5)")
+lines(final_forecast,col="blue")
+legend("bottomleft", legend=c("Actual","Forecast"), lty=c(1,1,1), col=c( "black", "blue"))
+```
+
+
+
+
